@@ -1,13 +1,16 @@
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Depends, status, Request
+from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 import uuid
 import os
+from jose import jwt, JWTError
 from openai import AzureOpenAI
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
+from passlib.context import CryptContext
 import logging
 
 # Set up logging
@@ -21,7 +24,6 @@ mongo_uri = os.getenv("MONGO_URI").replace("<db_password>", os.getenv("MONGO_PAS
 mongo_db_name = os.getenv("MONGO_DB_NAME", "workout_tracker")
 try:
     client = MongoClient(mongo_uri, server_api=ServerApi('1'), tls=True)
-    # Test connection
     client.admin.command('ping')
     logger.info("Successfully connected to MongoDB Atlas!")
 except Exception as e:
@@ -32,11 +34,32 @@ db = client[mongo_db_name]
 users_collection = db["users"]
 workouts_collection = db["workouts"]
 
+# JWT configuration
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key")
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Password hashing
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+# OAuth2 scheme
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
+
 app = FastAPI(
     title="Workout Tracker API",
     description="API for processing workout prompts and tracking fitness data per user",
     version="1.0.0"
 )
+
+# Middleware to log incoming requests
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Incoming request: {request.method} {request.url}")
+    logger.info(f"Headers: {dict(request.headers)}")
+    body = await request.body()
+    logger.info(f"Body: {body.decode('utf-8') if body else 'Empty'}")
+    response = await call_next(request)
+    return response
 
 # Exercise database
 EXERCISE_DB = {
@@ -59,7 +82,6 @@ ai_client = AzureOpenAI(
 # Pydantic models
 class WorkoutPrompt(BaseModel):
     prompt: str
-    user_id: str
 
 class WorkoutData(BaseModel):
     id: str
@@ -74,8 +96,9 @@ class WorkoutData(BaseModel):
     muscle_group: Optional[str] = None
 
 class UserProfileCreate(BaseModel):
-    user_id: str
     username: str
+    email: EmailStr
+    password: str
     height_cm: Optional[float] = None
     weight_kg: Optional[float] = None
     age: Optional[int] = None
@@ -83,6 +106,36 @@ class UserProfileCreate(BaseModel):
 class UserProfile(BaseModel):
     user_id: str
     username: str
+    email: EmailStr
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
+    age: Optional[int] = None
+    created_at: datetime
+    total_workouts: int = 0
+
+class StatsResponse(BaseModel):
+    total_sets: int
+    total_reps: int
+    total_volume: float
+    muscle_group_breakdown: Dict[str, float]
+    daily: Dict[str, List[WorkoutData]]
+    weekly: Dict[str, List[WorkoutData]]
+    monthly: Dict[str, List] = None
+    timestamp: datetime
+    muscle_group: Optional[str] = None
+
+class UserProfileCreate(BaseModel):
+    username: str
+    email: EmailStr
+    password: str
+    height_cm: Optional[float] = None
+    weight_kg: Optional[float] = None
+    age: Optional[int] = None
+
+class UserProfile(BaseModel):
+    user_id: str
+    username: str
+    email: EmailStr
     height_cm: Optional[float] = None
     weight_kg: Optional[float] = None
     age: Optional[int] = None
@@ -97,6 +150,10 @@ class StatsResponse(BaseModel):
     daily: Dict[str, List[WorkoutData]]
     weekly: Dict[str, List[WorkoutData]]
     monthly: Dict[str, List[WorkoutData]]
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str
 
 # Helper functions
 def estimate_calories(workout_name: str, sets: int, reps: int, weight_kg: float) -> float:
@@ -139,15 +196,107 @@ def extract_workout_data(prompt: str) -> dict:
         logger.error(f"AI extraction failed: {str(e)}")
         raise HTTPException(status_code=400, detail=f"Failed to process prompt with AI: {str(e)}")
 
-# API Endpoints
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def get_password_hash(password: str) -> str:
+    return pwd_context.hash(password)
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
+    to_encode = data.copy()
+    if expires_delta:
+        expire = datetime.utcnow() + expires_delta
+    else:
+        expire = datetime.utcnow() + timedelta(minutes=15)
+    to_encode.update({"exp": expire})
+    encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+    return encoded_jwt
+
+async def get_current_user(token: str = Depends(oauth2_scheme)):
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+    user = users_collection.find_one({"user_id": user_id})
+    if user is None:
+        raise credentials_exception
+    return UserProfile(**user)
+
+# Authentication Endpoints
+@app.post("/api/auth/register", response_model=UserProfile)
+async def register(user: UserProfileCreate):
+    """Register a new user"""
+    try:
+        if users_collection.find_one({"email": user.email}):
+            raise HTTPException(status_code=400, detail="Email already registered")
+        
+        user_id = str(uuid.uuid4())
+        hashed_password = get_password_hash(user.password)
+        user_data = {
+            "user_id": user_id,
+            "username": user.username,
+            "email": user.email,
+            "hashed_password": hashed_password,
+            "height_cm": user.height_cm,
+            "weight_kg": user.weight_kg,
+            "age": user.age,
+            "created_at": datetime.utcnow(),
+            "total_workouts": 0
+        }
+        result = users_collection.insert_one(user_data)
+        logger.info(f"Registered user with ID: {user_id}, Mongo ID: {result.inserted_id}")
+        return UserProfile(**user_data)
+    except Exception as e:
+        logger.error(f"Failed to register user: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Registration failed: {str(e)}")
+
+@app.post("/api/auth/login", response_model=Token)
+async def login(form_data: OAuth2PasswordRequestForm = Depends()):
+    """Login and generate JWT token"""
+    try:
+        logger.info(f"Login attempt with email: {form_data.username}")
+        user = users_collection.find_one({"email": form_data.username})
+        if not user:
+            logger.warning(f"No user found with email: {form_data.username}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        if not verify_password(form_data.password, user["hashed_password"]):
+            logger.warning(f"Password verification failed for email: {form_data.username}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user["user_id"]}, expires_delta=access_token_expires
+        )
+        logger.info(f"User logged in: {user['user_id']}")
+        return {"access_token": access_token, "token_type": "bearer"}
+    except Exception as e:
+        logger.error(f"Failed to login: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
+
+# Protected API Endpoints
 @app.post("/api/workout/log/", response_model=WorkoutData)
-async def log_workout(workout: WorkoutPrompt):
-    """Log a new workout for a user"""
+async def log_workout(workout: WorkoutPrompt, current_user: UserProfile = Depends(get_current_user)):
+    """Log a new workout for the authenticated user"""
     extracted_data = extract_workout_data(workout.prompt)
     
     workout_data = {
         "id": str(uuid.uuid4()),
-        "user_id": workout.user_id,
+        "user_id": current_user.user_id,
         "workout_name": extracted_data["workout_name"],
         "sets": extracted_data["sets"],
         "reps": extracted_data["reps"],
@@ -164,19 +313,11 @@ async def log_workout(workout: WorkoutPrompt):
     }
     
     try:
-        # Check if user exists
-        user = users_collection.find_one({"user_id": workout.user_id})
-        if not user:
-            logger.warning(f"No profile found for user_id: {workout.user_id}")
-            raise HTTPException(status_code=400, detail="User profile must be created first")
-        
-        # Insert workout
         result = workouts_collection.insert_one(workout_data)
-        logger.info(f"Workout inserted with ID: {result.inserted_id}")
+        logger.info(f"Workout inserted with ID: {result.inserted_id} for user: {current_user.user_id}")
         
-        # Update user's total_workouts
         users_collection.update_one(
-            {"user_id": workout.user_id},
+            {"user_id": current_user.user_id},
             {"$inc": {"total_workouts": 1}}
         )
         
@@ -185,26 +326,22 @@ async def log_workout(workout: WorkoutPrompt):
         logger.error(f"Failed to log workout: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/api/workout/history/{user_id}", response_model=List[WorkoutData])
-async def get_workout_history(user_id: str):
-    """Retrieve workout history for a specific user"""
+@app.get("/api/workout/history/", response_model=List[WorkoutData])
+async def get_workout_history(current_user: UserProfile = Depends(get_current_user)):
+    """Retrieve workout history for the authenticated user"""
     try:
-        workouts = list(workouts_collection.find({"user_id": user_id}))
-        logger.info(f"Found {len(workouts)} workouts for user_id: {user_id}")
+        workouts = list(workouts_collection.find({"user_id": current_user.user_id}))
+        logger.info(f"Found {len(workouts)} workouts for user_id: {current_user.user_id}")
         return [WorkoutData(**{**w, "id": str(w["id"])}) for w in workouts]
     except Exception as e:
         logger.error(f"Failed to fetch workout history: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
-@app.get("/api/workout/stats/{user_id}", response_model=StatsResponse)
-async def get_workout_stats(user_id: str):
-    """Get detailed workout statistics and summaries for a user"""
+@app.get("/api/workout/stats/", response_model=StatsResponse)
+async def get_workout_stats(current_user: UserProfile = Depends(get_current_user)):
+    """Get detailed workout statistics and summaries for the authenticated user"""
     try:
-        if not users_collection.find_one({"user_id": user_id}):
-            logger.warning(f"No profile found for user_id: {user_id}")
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        workouts = list(workouts_collection.find({"user_id": user_id}))
+        workouts = list(workouts_collection.find({"user_id": current_user.user_id}))
         if not workouts:
             return StatsResponse(
                 total_sets=0,
@@ -265,63 +402,15 @@ async def get_workout_stats(user_id: str):
 
 @app.post("/api/user/profile/", response_model=UserProfile)
 async def create_or_update_user_profile(profile: UserProfileCreate):
-    """Create or update a user profile with personal data"""
-    try:
-        existing_profile = users_collection.find_one({"user_id": profile.user_id})
-        
-        if existing_profile:
-            updated_profile = {
-                "user_id": profile.user_id,
-                "username": profile.username or existing_profile["username"],
-                "height_cm": profile.height_cm if profile.height_cm is not None else existing_profile["height_cm"],
-                "weight_kg": profile.weight_kg if profile.weight_kg is not None else existing_profile["weight_kg"],
-                "age": profile.age if profile.age is not None else existing_profile["age"],
-                "created_at": existing_profile["created_at"],
-                "total_workouts": existing_profile["total_workouts"]
-            }
-            users_collection.update_one(
-                {"user_id": profile.user_id},
-                {"$set": updated_profile}
-            )
-            logger.info(f"Updated profile for user_id: {profile.user_id}")
-        else:
-            updated_profile = {
-                "user_id": profile.user_id,
-                "username": profile.username,
-                "height_cm": profile.height_cm,
-                "weight_kg": profile.weight_kg,
-                "age": profile.age,
-                "created_at": datetime.utcnow(),
-                "total_workouts": 0
-            }
-            result = users_collection.insert_one(updated_profile)
-            logger.info(f"Created profile for user_id: {profile.user_id} with ID: {result.inserted_id}")
-        
-        return UserProfile(**updated_profile)
-    except Exception as e:
-        logger.error(f"Failed to create/update profile: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
+    """Create a new user profile (public endpoint for registration)"""
+    return await register(profile)
 
-@app.get("/api/user/profile/{user_id}", response_model=UserProfile)
-async def get_user_profile(user_id: str):
-    """Fetch user profile data"""
+@app.get("/api/user/profile/", response_model=UserProfile)
+async def get_user_profile(current_user: UserProfile = Depends(get_current_user)):
+    """Fetch profile data for the authenticated user"""
     try:
-        profile = users_collection.find_one({"user_id": user_id})
-        if not profile:
-            logger.warning(f"No profile found for user_id: {user_id}")
-            raise HTTPException(status_code=404, detail="User not found")
-        logger.info(f"Fetched profile for user_id: {user_id}")
-        return UserProfile(**profile)
+        logger.info(f"Fetched profile for user_id: {current_user.user_id}")
+        return current_user
     except Exception as e:
         logger.error(f"Failed to fetch profile: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
-
-def main():
-    test_prompt = "I did 3 sets of bench press with 50kg for 10 reps"
-    test_user_id = "user123"
-    print(f">>> POST /api/workout/log/ with prompt: '{test_prompt}' for user: {test_user_id}")
-    extracted = extract_workout_data(test_prompt)
-    print(f"Extracted data: {extracted}")
-
-if __name__ == "__main__":
-    main()

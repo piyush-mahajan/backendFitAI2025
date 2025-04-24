@@ -1,5 +1,5 @@
 to start it 
  .\fit2025\Scripts\activate
 
- 
+ uvicorn workout_tracker:app --reload
 
