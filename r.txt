@@ -1,0 +1,5 @@
+to start it 
+ .\fit2025\Scripts\activate
+
+ 
+
