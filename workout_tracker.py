@@ -1,17 +1,22 @@
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 from typing import Optional, List, Dict
 from datetime import datetime, timedelta
 import uuid
 import os
+import razorpay
+import json
+import logging
+import hmac
+import hashlib
 from jose import jwt, JWTError
 from openai import AzureOpenAI
 from pymongo import MongoClient
 from pymongo.server_api import ServerApi
 from passlib.context import CryptContext
-import logging
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -39,6 +44,15 @@ SECRET_KEY = os.getenv("JWT_SECRET_KEY", "your-secret-key")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
+# Razorpay setup (Test Mode)
+try:
+    razorpay_client = razorpay.Client(auth=(os.getenv("RAZORPAY_KEY_ID"), os.getenv("RAZORPAY_KEY_SECRET")))
+    razorpay_client.set_app_details({"title": "Workout Tracker", "version": "1.0"})
+    logger.info("Razorpay client initialized successfully")
+except Exception as e:
+    logger.error(f"Failed to initialize Razorpay client: {str(e)}")
+    raise Exception(f"Razorpay initialization failed: {str(e)}")
+
 # Password hashing
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -51,15 +65,8 @@ app = FastAPI(
     version="1.0.0"
 )
 
-# Middleware to log incoming requests
-@app.middleware("http")
-async def log_requests(request: Request, call_next):
-    logger.info(f"Incoming request: {request.method} {request.url}")
-    logger.info(f"Headers: {dict(request.headers)}")
-    body = await request.body()
-    logger.info(f"Body: {body.decode('utf-8') if body else 'Empty'}")
-    response = await call_next(request)
-    return response
+# Mount static files for serving the subscription frontend
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Exercise database
 EXERCISE_DB = {
@@ -112,35 +119,10 @@ class UserProfile(BaseModel):
     age: Optional[int] = None
     created_at: datetime
     total_workouts: int = 0
-
-class StatsResponse(BaseModel):
-    total_sets: int
-    total_reps: int
-    total_volume: float
-    muscle_group_breakdown: Dict[str, float]
-    daily: Dict[str, List[WorkoutData]]
-    weekly: Dict[str, List[WorkoutData]]
-    monthly: Dict[str, List] = None
-    timestamp: datetime
-    muscle_group: Optional[str] = None
-
-class UserProfileCreate(BaseModel):
-    username: str
-    email: EmailStr
-    password: str
-    height_cm: Optional[float] = None
-    weight_kg: Optional[float] = None
-    age: Optional[int] = None
-
-class UserProfile(BaseModel):
-    user_id: str
-    username: str
-    email: EmailStr
-    height_cm: Optional[float] = None
-    weight_kg: Optional[float] = None
-    age: Optional[int] = None
-    created_at: datetime
-    total_workouts: int = 0
+    subscription_status: Optional[str] = "inactive"
+    subscription_plan: Optional[str] = None
+    subscription_order_id: Optional[str] = None
+    subscription_end_date: Optional[datetime] = None
 
 class StatsResponse(BaseModel):
     total_sets: int
@@ -154,6 +136,13 @@ class StatsResponse(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+class SubscriptionRequest(BaseModel):
+    plan_id: str
+
+class SubscriptionResponse(BaseModel):
+    order_id: str
+    razorpay_key: str
 
 # Helper functions
 def estimate_calories(workout_name: str, sets: int, reps: int, weight_kg: float) -> float:
@@ -180,7 +169,7 @@ def extract_workout_data(prompt: str) -> dict:
             ],
             response_format={"type": "json_object"}
         )
-        extracted = eval(response.choices[0].message.content)  # Use json.loads in production
+        extracted = eval(response.choices[0].message.content)
         workout_name = extracted.get("workout_name", "unknown").lower()
         muscle_group = extracted.get("muscle_group")
         if workout_name in EXERCISE_DB:
@@ -212,6 +201,12 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
+def generate_receipt_id(user_id: str) -> str:
+    # Use a short prefix, first 12 chars of user_id, and a 6-digit timestamp
+    timestamp = str(int(datetime.utcnow().timestamp()))[-6:]
+    return f"wt_{user_id[:12]}_{timestamp}"
+
+# Authentication dependencies
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -230,10 +225,21 @@ async def get_current_user(token: str = Depends(oauth2_scheme)):
         raise credentials_exception
     return UserProfile(**user)
 
+async def get_premium_user(token: str = Depends(oauth2_scheme)):
+    user = await get_current_user(token)
+    if user.subscription_status != "active":
+        raise HTTPException(status_code=403, detail="Premium subscription required")
+    if user.subscription_end_date and user.subscription_end_date < datetime.utcnow():
+        users_collection.update_one(
+            {"user_id": user.user_id},
+            {"$set": {"subscription_status": "inactive"}}
+        )
+        raise HTTPException(status_code=403, detail="Subscription expired")
+    return user
+
 # Authentication Endpoints
 @app.post("/api/auth/register", response_model=UserProfile)
 async def register(user: UserProfileCreate):
-    """Register a new user"""
     try:
         if users_collection.find_one({"email": user.email}):
             raise HTTPException(status_code=400, detail="Email already registered")
@@ -249,7 +255,11 @@ async def register(user: UserProfileCreate):
             "weight_kg": user.weight_kg,
             "age": user.age,
             "created_at": datetime.utcnow(),
-            "total_workouts": 0
+            "total_workouts": 0,
+            "subscription_status": "inactive",
+            "subscription_plan": None,
+            "subscription_order_id": None,
+            "subscription_end_date": None
         }
         result = users_collection.insert_one(user_data)
         logger.info(f"Registered user with ID: {user_id}, Mongo ID: {result.inserted_id}")
@@ -260,7 +270,6 @@ async def register(user: UserProfileCreate):
 
 @app.post("/api/auth/login", response_model=Token)
 async def login(form_data: OAuth2PasswordRequestForm = Depends()):
-    """Login and generate JWT token"""
     try:
         logger.info(f"Login attempt with email: {form_data.username}")
         user = users_collection.find_one({"email": form_data.username})
@@ -288,31 +297,183 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends()):
         logger.error(f"Failed to login: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Login failed: {str(e)}")
 
+# Subscription Endpoints
+@app.get("/api/subscriptions/plans/")
+async def get_subscription_plans():
+    try:
+        plans = [
+            {"name": "Basic Plan", "plan_id": "plan_basic", "amount": 199, "description": "Access to workout logging and basic stats"},
+            {"name": "Pro Plan", "plan_id": "plan_pro", "amount": 499, "description": "Access to advanced analytics and recommendations"},
+            {"name": "Elite Plan", "plan_id": "plan_elite", "amount": 999, "description": "Access to all features including virtual coaching"}
+        ]
+        logger.info("Fetched subscription plans")
+        return plans
+    except Exception as e:
+        logger.error(f"Failed to fetch plans: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to fetch plans: {str(e)}")
+
+@app.post("/api/subscriptions/create/", response_model=SubscriptionResponse)
+async def create_subscription(request: SubscriptionRequest, current_user: UserProfile = Depends(get_current_user)):
+    try:
+        if current_user.subscription_status == "active":
+            logger.warning(f"User {current_user.user_id} already has an active subscription")
+            raise HTTPException(status_code=400, detail="User already has an active subscription")
+
+        logger.info(f"Starting subscription creation for user {current_user.user_id}")
+        logger.info(f"Razorpay Key ID: {os.getenv('RAZORPAY_KEY_ID')}")
+        logger.info(f"Razorpay Key Secret: {os.getenv('RAZORPAY_KEY_SECRET')[:4]}... (partial for security)")
+
+        # Map plan_id to amount
+        plan_amounts = {
+            "plan_basic": 19900,  # ₹199 in paise
+            "plan_pro": 49900,    # ₹499 in paise
+            "plan_elite": 99900   # ₹999 in paise
+        }
+        plan_names = {
+            "plan_basic": "Basic Plan",
+            "plan_pro": "Pro Plan",
+            "plan_elite": "Elite Plan"
+        }
+        amount_paise = plan_amounts.get(request.plan_id)
+        plan_name = plan_names.get(request.plan_id)
+        if not amount_paise or not plan_name:
+            logger.error(f"Invalid plan_id: {request.plan_id}")
+            raise HTTPException(status_code=400, detail="Invalid plan ID")
+
+        # Generate a short receipt ID
+        receipt_id = generate_receipt_id(current_user.user_id)
+        logger.info(f"Generated receipt_id: {receipt_id}")
+
+        # Create Razorpay Order
+        order_data = {
+            "amount": amount_paise,
+            "currency": "INR",
+            "receipt": receipt_id,
+            "notes": {
+                "name": current_user.username,
+                "email": current_user.email,
+                "contact": "9999999999",
+                "source": "Workout Tracker App",
+                "plan_id": request.plan_id
+            }
+        }
+
+        try:
+            order_response = razorpay_client.order.create(data=order_data)
+            order_id = order_response['id']
+            logger.info(f"Razorpay Order Created for user {current_user.user_id}! Order ID: {order_id}")
+        except razorpay.errors.BadRequestError as e:
+            logger.error(f"Razorpay API Error (Bad Request): {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Razorpay API Error (Bad Request): {str(e)}")
+        except Exception as e:
+            logger.error(f"Unexpected error while creating order: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Unexpected error while creating order: {str(e)}")
+
+        # Update user with order ID and plan
+        try:
+            users_collection.update_one(
+                {"user_id": current_user.user_id},
+                {"$set": {
+                    "subscription_order_id": order_id,
+                    "subscription_status": "pending",
+                    "subscription_plan": request.plan_id
+                }}
+            )
+            logger.info(f"Updated user {current_user.user_id} with order ID: {order_id}")
+        except Exception as e:
+            logger.error(f"Failed to update user in database: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to update user in database: {str(e)}")
+
+        return SubscriptionResponse(
+            order_id=order_id,
+            razorpay_key=os.getenv("RAZORPAY_KEY_ID")
+        )
+    except Exception as e:
+        logger.error(f"Failed to create subscription for user {current_user.user_id}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to create subscription: {str(e)}")
+
+@app.post("/api/webhooks/razorpay/")
+async def razorpay_webhook(request: Request):
+    try:
+        body = await request.body()
+        body_str = body.decode('utf-8')
+        signature = request.headers.get("x-razorpay-signature")
+        webhook_secret = os.getenv("RAZORPAY_WEBHOOK_SECRET")
+
+        if not webhook_secret:
+            logger.error("Webhook secret not set in environment variables")
+            raise HTTPException(status_code=500, detail="Webhook secret not configured")
+
+        # Verify webhook signature
+        expected_signature = hmac.new(
+            key=webhook_secret.encode('utf-8'),
+            msg=body,
+            digestmod=hashlib.sha256
+        ).hexdigest()
+
+        logger.info(f"Expected signature: {expected_signature}, Received signature: {signature}")
+        if not hmac.compare_digest(expected_signature, signature):
+            logger.error("Webhook signature verification failed")
+            raise HTTPException(status_code=400, detail="Webhook signature verification failed")
+
+        event = json.loads(body_str)
+        logger.info(f"Webhook event received: {event['event']}")
+
+        if event["event"] == "payment.authorized":
+            payment_entity = event["payload"]["payment"]["entity"]
+            order_id = payment_entity["order_id"]
+            logger.info(f"Processing payment.authorized for order ID: {order_id}")
+
+            user = users_collection.find_one({"subscription_order_id": order_id})
+            if not user:
+                logger.error(f"User not found for order ID: {order_id}")
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # Update user subscription status
+            plan_duration = {
+                "plan_basic": 30,  # 30 days for Basic
+                "plan_pro": 60,    # 60 days for Pro
+                "plan_elite": 90   # 90 days for Elite
+            }
+            duration_days = plan_duration.get(user["subscription_plan"], 30)
+            users_collection.update_one(
+                {"subscription_order_id": order_id},
+                {"$set": {
+                    "subscription_status": "active",
+                    "subscription_end_date": datetime.utcnow() + timedelta(days=duration_days)
+                }}
+            )
+            logger.info(f"Updated subscription status to active for user: {user['user_id']}")
+
+        return {"status": "success"}
+    except Exception as e:
+        logger.error(f"Webhook error: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Webhook verification failed: {str(e)}")
+
 # Protected API Endpoints
 @app.post("/api/workout/log/", response_model=WorkoutData)
-async def log_workout(workout: WorkoutPrompt, current_user: UserProfile = Depends(get_current_user)):
-    """Log a new workout for the authenticated user"""
-    extracted_data = extract_workout_data(workout.prompt)
-    
-    workout_data = {
-        "id": str(uuid.uuid4()),
-        "user_id": current_user.user_id,
-        "workout_name": extracted_data["workout_name"],
-        "sets": extracted_data["sets"],
-        "reps": extracted_data["reps"],
-        "weight_kg": extracted_data["weight_kg"],
-        "calories_burned": estimate_calories(
-            extracted_data["workout_name"],
-            extracted_data["sets"],
-            extracted_data["reps"],
-            extracted_data["weight_kg"]
-        ),
-        "duration_minutes": None,
-        "timestamp": datetime.utcnow(),
-        "muscle_group": extracted_data["muscle_group"]
-    }
-    
+async def log_workout(workout: WorkoutPrompt, current_user: UserProfile = Depends(get_premium_user)):
     try:
+        extracted_data = extract_workout_data(workout.prompt)
+        
+        workout_data = {
+            "id": str(uuid.uuid4()),
+            "user_id": current_user.user_id,
+            "workout_name": extracted_data["workout_name"],
+            "sets": extracted_data["sets"],
+            "reps": extracted_data["reps"],
+            "weight_kg": extracted_data["weight_kg"],
+            "calories_burned": estimate_calories(
+                extracted_data["workout_name"],
+                extracted_data["sets"],
+                extracted_data["reps"],
+                extracted_data["weight_kg"]
+            ),
+            "duration_minutes": None,
+            "timestamp": datetime.utcnow(),
+            "muscle_group": extracted_data["muscle_group"]
+        }
+        
         result = workouts_collection.insert_one(workout_data)
         logger.info(f"Workout inserted with ID: {result.inserted_id} for user: {current_user.user_id}")
         
@@ -327,8 +488,7 @@ async def log_workout(workout: WorkoutPrompt, current_user: UserProfile = Depend
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/api/workout/history/", response_model=List[WorkoutData])
-async def get_workout_history(current_user: UserProfile = Depends(get_current_user)):
-    """Retrieve workout history for the authenticated user"""
+async def get_workout_history(current_user: UserProfile = Depends(get_premium_user)):
     try:
         workouts = list(workouts_collection.find({"user_id": current_user.user_id}))
         logger.info(f"Found {len(workouts)} workouts for user_id: {current_user.user_id}")
@@ -338,8 +498,7 @@ async def get_workout_history(current_user: UserProfile = Depends(get_current_us
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
 
 @app.get("/api/workout/stats/", response_model=StatsResponse)
-async def get_workout_stats(current_user: UserProfile = Depends(get_current_user)):
-    """Get detailed workout statistics and summaries for the authenticated user"""
+async def get_workout_stats(current_user: UserProfile = Depends(get_premium_user)):
     try:
         workouts = list(workouts_collection.find({"user_id": current_user.user_id}))
         if not workouts:
@@ -402,12 +561,10 @@ async def get_workout_stats(current_user: UserProfile = Depends(get_current_user
 
 @app.post("/api/user/profile/", response_model=UserProfile)
 async def create_or_update_user_profile(profile: UserProfileCreate):
-    """Create a new user profile (public endpoint for registration)"""
     return await register(profile)
 
 @app.get("/api/user/profile/", response_model=UserProfile)
 async def get_user_profile(current_user: UserProfile = Depends(get_current_user)):
-    """Fetch profile data for the authenticated user"""
     try:
         logger.info(f"Fetched profile for user_id: {current_user.user_id}")
         return current_user

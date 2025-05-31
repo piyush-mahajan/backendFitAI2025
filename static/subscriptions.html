@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Workout Tracker - Subscriptions</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+</head>
+
+<body class="bg-gray-100 flex items-center justify-center min-h-screen">
+    <div class="bg-white p-6 rounded-lg shadow-lg w-full max-w-2xl">
+        <h1 class="text-2xl font-bold mb-4 text-center">Choose Your Subscription Plan</h1>
+        <div id="plans" class="space-y-4"></div>
+    </div>
+
+    <script>
+        // Fetch user profile to get email and contact
+        async function fetchUserProfile() {
+            try {
+                const response = await fetch('http://localhost:8000/api/user/profile/', {
+                    headers: {
+                        'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI4ZjcwYzYxNS01ODJmLTQ3MTktODBiYS01NWI3MWQ0M2E1MWIiLCJleHAiOjE3NDU3Njg0NjV9.0aWtUFDdjaI38VNqFWbPCFhnrDidSTy-BSagIqASDbM'
+                    }
+                });
+                if (!response.ok) {
+                    throw new Error('Failed to fetch user profile');
+                }
+                const user = await response.json();
+                return user;
+            } catch (error) {
+                console.error('Error fetching user profile:', error);
+                alert('Please log in to continue.');
+                window.location.href = '/static/login.html'; // Redirect to login page if not authenticated
+            }
+        }
+
+        // Fetch available plans
+        async function fetchPlans() {
+            try {
+                const response = await fetch('http://localhost:8000/api/subscriptions/plans/', {
+                    headers: {
+                        'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI4ZjcwYzYxNS01ODJmLTQ3MTktODBiYS01NWI3MWQ0M2E1MWIiLCJleHAiOjE3NDU3Njg0NjV9.0aWtUFDdjaI38VNqFWbPCFhnrDidSTy-BSagIqASDbM'
+                    }
+                });
+                if (!response.ok) {
+                    throw new Error('Failed to fetch plans');
+                }
+                const plans = await response.json();
+                const plansDiv = document.getElementById('plans');
+                plansDiv.innerHTML = ''; // Clear any existing content
+                plans.forEach(plan => {
+                    const planCard = document.createElement('div');
+                    planCard.className = 'border p-4 rounded-lg flex justify-between items-center';
+                    planCard.innerHTML = `
+                        <div>
+                            <h2 class="text-lg font-semibold">${plan.name}</h2>
+                            <p>₹${plan.amount}/month</p>
+                            <p>${plan.description}</p>
+                        </div>
+                        <button class="bg-blue-500 text-white px-4 py-2 rounded hover:bg-blue-600"
+                                onclick="subscribe('${plan.plan_id}', ${plan.amount})">Subscribe</button>
+                    `;
+                    plansDiv.appendChild(planCard);
+                });
+            } catch (error) {
+                console.error('Error fetching plans:', error);
+                alert('Failed to load subscription plans. Please try again.');
+            }
+        }
+
+        // Initiate subscription payment
+        async function subscribe(planId, amount) {
+            try {
+                // Fetch user profile for email and contact
+                const user = await fetchUserProfile();
+                if (!user) return;
+
+                // Create Razorpay order
+                const response = await fetch('http://localhost:8000/api/subscriptions/create/', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': 'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiI4ZjcwYzYxNS01ODJmLTQ3MTktODBiYS01NWI3MWQ0M2E1MWIiLCJleHAiOjE3NDU3Njg0NjV9.0aWtUFDdjaI38VNqFWbPCFhnrDidSTy-BSagIqASDbM'
+
+                        // 'Authorization': 'Bearer ' + localStorage.getItem('token')
+                    },
+                    body: JSON.stringify({ plan_id: planId })
+                });
+
+                if (!response.ok) {
+                    const errorData = await response.json();
+                    throw new Error(errorData.detail || 'Failed to create order');
+                }
+
+                const data = await response.json();
+
+                const options = {
+                    key: data.razorpay_key,
+                    amount: amount * 100, // Convert to paise
+                    currency: "INR",
+                    order_id: data.order_id,
+                    name: 'Workout Tracker',
+                    description: `Subscription to ${planId}`,
+                    image: 'https://x.ai/static/xAI_logo-3f5d5a570b2247ec22a2c5b6a6ae8492.png',
+                    handler: function (response) {
+                        alert('Payment successful! Your subscription will be activated shortly.');
+                        // Note: Webhook will handle updating the subscription status
+                    },
+                    prefill: {
+                        email: user.email,
+                        contact: '9999999999' // Use a field from user profile if available
+                    },
+                    theme: {
+                        color: '#3399cc'
+                    },
+                    modal: {
+                        ondismiss: function () {
+                            alert('Payment window closed. Please try again or contact support.');
+                        }
+                    }
+                };
+
+                const rzp = new Razorpay(options);
+                rzp.open();
+            } catch (error) {
+                console.error('Error initiating payment:', error);
+                alert('Failed to initiate payment: ' + error.message);
+            }
+        }
+
+        // Load plans on page load
+        window.onload = fetchPlans;
+    </script>
+</body>
+
+</html>

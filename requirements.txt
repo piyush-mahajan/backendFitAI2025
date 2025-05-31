@@ -3,3 +3,4 @@ passlib[bcrypt]
 python-multipart
 jwt
 pydantic[email]
+razorpay
